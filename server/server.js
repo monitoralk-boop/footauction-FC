@@ -16,10 +16,13 @@ const wss = new WebSocket.Server({ server, path: '/ws' });
 // ==========================================
 // SUPABASE POSTGRESQL & MEMORY CACHE
 // ==========================================
+const DEFAULT_SUPABASE_URL = 'postgresql://postgres.uacilczaagxjhzyrmdhs:Ac18052002%40Ac18052002@aws-0-eu-west-1.pooler.supabase.com:5432/postgres';
+const databaseUrl = process.env.DATABASE_URL || DEFAULT_SUPABASE_URL;
+
 let dbPool = null;
-if (process.env.DATABASE_URL) {
+if (databaseUrl) {
     dbPool = new Pool({
-        connectionString: process.env.DATABASE_URL,
+        connectionString: databaseUrl,
         ssl: { rejectUnauthorized: false }
     });
     console.log('⚡ Initializing Supabase PostgreSQL connection...');
