@@ -2,6 +2,7 @@ const express = require('express');
 const http = require('http');
 const WebSocket = require('ws');
 const cors = require('cors');
+const { Pool } = require('pg');
 require('dotenv').config();
 
 const app = express();
@@ -13,28 +14,38 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server, path: '/ws' });
 
 // ==========================================
-// IN-MEMORY GAME DATABASE (READY FOR SUPABASE/POSTGRES)
+// SUPABASE POSTGRESQL & MEMORY CACHE
 // ==========================================
-// User structure:
-// { id, email, managerName, tagNumber, fullTag, clubName, avatarIcon, budget, trophies, divisionTier, squad, reserves, createdAt }
+let dbPool = null;
+if (process.env.DATABASE_URL) {
+    dbPool = new Pool({
+        connectionString: process.env.DATABASE_URL,
+        ssl: { rejectUnauthorized: false }
+    });
+    console.log('⚡ Initializing Supabase PostgreSQL connection...');
+} else {
+    console.log('ℹ️ Running in memory mode (Set DATABASE_URL to connect to Supabase).');
+}
+
+// In-Memory Real-Time State for low-latency WebSocket gameplay
 const users = new Map();
 const usersByTag = new Map(); // "managername#1234" -> user
 const friendships = new Map(); // userId -> Set<friendUserId>
 const pendingFriendRequests = new Map(); // requestId -> { id, fromUserId, toUserId, timestamp, status }
 const marketListings = new Map(); // listingId -> { id, sellerId, card, currentBid, buyNowPrice, highestBidderId, expiresAt, status }
 
-// Online WebSockets map: userId -> WebSocket
+// Online WebSockets: userId -> WebSocket
 const activeConnections = new Map();
-// Active Auction Rooms: roomCode -> { roomCode, hostId, guestId, state, timerJob, ... }
+// Active Auction Rooms: roomCode -> { roomCode, hostId, guestId, state, ... }
 const auctionRooms = new Map();
 
-// Helper: Generate random 4-digit tag
 function generateTagNumber() {
     return Math.floor(1000 + Math.random() * 9000);
 }
 
-// Seed initial system bots/mock users for transfer market & friends test
-function seedDefaultData() {
+// Initialize Supabase Tables (if not created yet) & Hydrate Cache
+async function initDatabase() {
+    // Seed default system bot
     const botUser = {
         id: 'usr_bot_zidane',
         email: 'zidane@footauction.fc',
@@ -52,8 +63,100 @@ function seedDefaultData() {
     };
     users.set(botUser.id, botUser);
     usersByTag.set(botUser.fullTag.toLowerCase(), botUser);
+
+    if (!dbPool) return;
+
+    try {
+        await dbPool.query(`
+            CREATE TABLE IF NOT EXISTS users (
+                id VARCHAR(100) PRIMARY KEY,
+                email VARCHAR(255) UNIQUE,
+                manager_name VARCHAR(60) NOT NULL,
+                tag_number INT NOT NULL,
+                full_tag VARCHAR(70) UNIQUE NOT NULL,
+                club_name VARCHAR(80) NOT NULL,
+                avatar_icon VARCHAR(10) DEFAULT '⚽',
+                budget BIGINT DEFAULT 20000000,
+                trophies INT DEFAULT 0,
+                division_tier INT DEFAULT 9,
+                created_at BIGINT DEFAULT EXTRACT(EPOCH FROM NOW()) * 1000
+            );
+
+            CREATE TABLE IF NOT EXISTS squads (
+                user_id VARCHAR(100) PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                starting_11 JSONB DEFAULT '[]'::jsonb,
+                reserves JSONB DEFAULT '[]'::jsonb,
+                formation VARCHAR(50) DEFAULT '4-3-3 Attack',
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS friendships (
+                id SERIAL PRIMARY KEY,
+                user_id VARCHAR(100) REFERENCES users(id) ON DELETE CASCADE,
+                friend_id VARCHAR(100) REFERENCES users(id) ON DELETE CASCADE,
+                status VARCHAR(20) DEFAULT 'ACCEPTED',
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                UNIQUE(user_id, friend_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS friend_requests (
+                request_id VARCHAR(100) PRIMARY KEY,
+                from_user_id VARCHAR(100) REFERENCES users(id) ON DELETE CASCADE,
+                to_user_id VARCHAR(100) REFERENCES users(id) ON DELETE CASCADE,
+                status VARCHAR(20) DEFAULT 'PENDING',
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            );
+
+            CREATE TABLE IF NOT EXISTS market_listings (
+                id VARCHAR(100) PRIMARY KEY,
+                seller_id VARCHAR(100) REFERENCES users(id) ON DELETE CASCADE,
+                seller_name VARCHAR(60) NOT NULL,
+                card_data JSONB NOT NULL,
+                starting_bid BIGINT NOT NULL,
+                current_bid BIGINT NOT NULL,
+                buy_now_price BIGINT NOT NULL,
+                highest_bidder_id VARCHAR(100) REFERENCES users(id),
+                expires_at BIGINT NOT NULL,
+                status VARCHAR(20) DEFAULT 'ACTIVE'
+            );
+        `);
+        console.log('✅ Supabase PostgreSQL schema verified & ready.');
+
+        // Load existing users from Supabase into memory
+        const res = await dbPool.query('SELECT * FROM users');
+        res.rows.forEach(row => {
+            const u = {
+                id: row.id,
+                email: row.email,
+                managerName: row.manager_name,
+                tagNumber: row.tag_number,
+                fullTag: row.full_tag,
+                clubName: row.club_name,
+                avatarIcon: row.avatar_icon,
+                budget: Number(row.budget),
+                trophies: row.trophies,
+                divisionTier: row.division_tier,
+                squad: [],
+                reserves: [],
+                createdAt: Number(row.created_at)
+            };
+            users.set(u.id, u);
+            usersByTag.set(u.fullTag.toLowerCase(), u);
+        });
+
+        // Load friendships
+        const fRes = await dbPool.query('SELECT * FROM friendships');
+        fRes.rows.forEach(r => {
+            if (!friendships.has(r.user_id)) friendships.set(r.user_id, new Set());
+            friendships.get(r.user_id).add(r.friend_id);
+        });
+
+        console.log(`[SUPABASE] Hydrated ${users.size} users and friendships into server memory.`);
+    } catch (err) {
+        console.error('❌ Supabase initialization error:', err.message);
+    }
 }
-seedDefaultData();
+initDatabase();
 
 // ==========================================
 // REST API ROUTES
@@ -64,6 +167,7 @@ app.get('/api/health', (req, res) => {
     res.json({
         status: 'online',
         service: 'FootAuction FC Master Game Server',
+        databaseConnected: !!dbPool,
         connectedPlayers: activeConnections.size,
         totalRegisteredUsers: users.size,
         activeAuctions: auctionRooms.size,
@@ -71,8 +175,8 @@ app.get('/api/health', (req, res) => {
     });
 });
 
-// 1. REGISTER / ACCOUNT CREATION
-app.post('/api/auth/register', (req, res) => {
+// 1. REGISTER
+app.post('/api/auth/register', async (req, res) => {
     const { email, managerName, clubName, avatarIcon } = req.body;
 
     if (!managerName || !clubName) {
@@ -83,7 +187,6 @@ app.post('/api/auth/register', (req, res) => {
     let tag = generateTagNumber();
     let fullTag = `${cleanName}#${tag}`;
 
-    // Ensure unique tag
     let attempts = 0;
     while (usersByTag.has(fullTag.toLowerCase()) && attempts < 20) {
         tag = generateTagNumber();
@@ -100,7 +203,7 @@ app.post('/api/auth/register', (req, res) => {
         fullTag: fullTag,
         clubName: clubName.trim(),
         avatarIcon: avatarIcon || '⚽',
-        budget: 20000000, // Starting €20M
+        budget: 20000000,
         trophies: 0,
         divisionTier: 9,
         squad: [],
@@ -112,37 +215,74 @@ app.post('/api/auth/register', (req, res) => {
     usersByTag.set(fullTag.toLowerCase(), newUser);
     friendships.set(userId, new Set());
 
-    // Auto-befriend the Zidane bot as welcoming friend!
+    // Auto-befriend Zidane bot
     friendships.get(userId).add('usr_bot_zidane');
     if (!friendships.has('usr_bot_zidane')) friendships.set('usr_bot_zidane', new Set());
     friendships.get('usr_bot_zidane').add(userId);
 
-    console.log(`[REGISTER] New Manager: ${fullTag} (Club: ${newUser.clubName})`);
+    // Save to Supabase PostgreSQL
+    if (dbPool) {
+        try {
+            await dbPool.query(
+                `INSERT INTO users (id, email, manager_name, tag_number, full_tag, club_name, avatar_icon, budget, trophies, division_tier)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                 ON CONFLICT (id) DO NOTHING`,
+                [newUser.id, newUser.email, newUser.managerName, newUser.tagNumber, newUser.fullTag, newUser.clubName, newUser.avatarIcon, newUser.budget, newUser.trophies, newUser.divisionTier]
+            );
+            await dbPool.query(
+                `INSERT INTO friendships (user_id, friend_id) VALUES ($1, 'usr_bot_zidane'), ('usr_bot_zidane', $1) ON CONFLICT DO NOTHING`,
+                [newUser.id]
+            );
+        } catch (dbErr) {
+            console.error('[SUPABASE WRITE ERROR]', dbErr.message);
+        }
+    }
 
-    res.json({
-        success: true,
-        user: newUser
-    });
+    console.log(`[REGISTER] New Manager saved to Supabase: ${fullTag}`);
+
+    res.json({ success: true, user: newUser });
 });
 
 // 2. LOGIN (BY TAG OR ID)
-app.post('/api/auth/login', (req, res) => {
-    const { identifier } = req.body; // Can be fullTag (e.g. "Coach#1234") or userId
-    if (!identifier) {
-        return res.status(400).json({ error: 'Tag or ID required' });
-    }
+app.post('/api/auth/login', async (req, res) => {
+    const { identifier } = req.body;
+    if (!identifier) return res.status(400).json({ error: 'Tag or ID required' });
 
     const clean = identifier.trim().toLowerCase();
-    const user = usersByTag.get(clean) || users.get(identifier.trim());
+    let user = usersByTag.get(clean) || users.get(identifier.trim());
 
-    if (!user) {
-        return res.status(404).json({ error: 'User not found. Check your Manager Tag.' });
+    // If not in cache, check Supabase
+    if (!user && dbPool) {
+        try {
+            const q = await dbPool.query('SELECT * FROM users WHERE LOWER(full_tag) = $1 OR id = $2', [clean, identifier.trim()]);
+            if (q.rows.length > 0) {
+                const r = q.rows[0];
+                user = {
+                    id: r.id,
+                    email: r.email,
+                    managerName: r.manager_name,
+                    tagNumber: r.tag_number,
+                    fullTag: r.full_tag,
+                    clubName: r.club_name,
+                    avatarIcon: r.avatar_icon,
+                    budget: Number(r.budget),
+                    trophies: r.trophies,
+                    divisionTier: r.division_tier,
+                    squad: [],
+                    reserves: [],
+                    createdAt: Number(r.created_at)
+                };
+                users.set(user.id, user);
+                usersByTag.set(user.fullTag.toLowerCase(), user);
+            }
+        } catch (err) {
+            console.error('[LOGIN DB QUERY ERROR]', err.message);
+        }
     }
 
-    res.json({
-        success: true,
-        user
-    });
+    if (!user) return res.status(404).json({ error: 'User not found. Check your Manager Tag.' });
+
+    res.json({ success: true, user });
 });
 
 // 3. GET PROFILE
@@ -152,8 +292,8 @@ app.get('/api/profile/:userId', (req, res) => {
     res.json({ success: true, user });
 });
 
-// 4. SQUAD SYNC (SAVE / LOAD)
-app.post('/api/squad/sync', (req, res) => {
+// 4. SQUAD SYNC (PERSISTED IN SUPABASE)
+app.post('/api/squad/sync', async (req, res) => {
     const { userId, squad, reserves, formation } = req.body;
     const user = users.get(userId);
     if (!user) return res.status(404).json({ error: 'User not found' });
@@ -162,11 +302,41 @@ app.post('/api/squad/sync', (req, res) => {
     if (Array.isArray(reserves)) user.reserves = reserves;
     if (formation) user.formation = formation;
 
-    res.json({ success: true, message: 'Squad synchronized with server.' });
+    if (dbPool) {
+        try {
+            await dbPool.query(
+                `INSERT INTO squads (user_id, starting_11, reserves, formation)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (user_id) DO UPDATE SET starting_11 = $2, reserves = $3, formation = $4, updated_at = NOW()`,
+                [userId, JSON.stringify(user.squad), JSON.stringify(user.reserves), user.formation || '4-3-3 Attack']
+            );
+        } catch (dbErr) {
+            console.error('[SUPABASE SQUAD SYNC ERROR]', dbErr.message);
+        }
+    }
+
+    res.json({ success: true, message: 'Squad synchronized with Supabase database.' });
 });
 
-app.get('/api/squad/:userId', (req, res) => {
+app.get('/api/squad/:userId', async (req, res) => {
     const user = users.get(req.params.userId);
+
+    // If squad empty in memory, check Supabase
+    if (dbPool && (!user || user.squad.length === 0)) {
+        try {
+            const sqRes = await dbPool.query('SELECT * FROM squads WHERE user_id = $1', [req.params.userId]);
+            if (sqRes.rows.length > 0) {
+                const row = sqRes.rows[0];
+                return res.json({
+                    success: true,
+                    squad: row.starting_11,
+                    reserves: row.reserves,
+                    formation: row.formation
+                });
+            }
+        } catch (_) {}
+    }
+
     if (!user) return res.status(404).json({ error: 'User not found' });
     res.json({
         success: true,
@@ -177,7 +347,6 @@ app.get('/api/squad/:userId', (req, res) => {
 });
 
 // 5. FRIENDS & SOCIAL SYSTEM
-// Get Friends List
 app.get('/api/friends/list/:userId', (req, res) => {
     const { userId } = req.params;
     const user = users.get(userId);
@@ -203,29 +372,20 @@ app.get('/api/friends/list/:userId', (req, res) => {
     res.json({ success: true, friends: friendsList });
 });
 
-// Send Friend Request by Tag
 app.post('/api/friends/request', (req, res) => {
     const { fromUserId, targetTag } = req.body;
     const fromUser = users.get(fromUserId);
     if (!fromUser) return res.status(404).json({ error: 'Sender not found' });
-
     if (!targetTag) return res.status(400).json({ error: 'Target tag required' });
 
     const cleanTargetTag = targetTag.trim().toLowerCase();
     const targetUser = usersByTag.get(cleanTargetTag);
 
-    if (!targetUser) {
-        return res.status(404).json({ error: `Manager with tag '${targetTag}' was not found.` });
-    }
-
-    if (targetUser.id === fromUserId) {
-        return res.status(400).json({ error: 'You cannot add yourself as a friend.' });
-    }
+    if (!targetUser) return res.status(404).json({ error: `Manager with tag '${targetTag}' was not found.` });
+    if (targetUser.id === fromUserId) return res.status(400).json({ error: 'You cannot add yourself.' });
 
     const userFriends = friendships.get(fromUserId) || new Set();
-    if (userFriends.has(targetUser.id)) {
-        return res.status(400).json({ error: `${targetUser.managerName} is already your friend!` });
-    }
+    if (userFriends.has(targetUser.id)) return res.status(400).json({ error: `${targetUser.managerName} is already your friend!` });
 
     const requestId = `freq_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     const request = {
@@ -242,38 +402,35 @@ app.post('/api/friends/request', (req, res) => {
 
     pendingFriendRequests.set(requestId, request);
 
-    // Notify target user via WebSocket if online!
-    const targetSocket = activeConnections.get(targetUser.id);
-    if (targetSocket && targetSocket.readyState === WebSocket.OPEN) {
-        targetSocket.send(JSON.stringify({
-            event: 'FRIEND_REQUEST_RECEIVED',
-            request
-        }));
+    if (dbPool) {
+        dbPool.query(
+            `INSERT INTO friend_requests (request_id, from_user_id, to_user_id, status) VALUES ($1, $2, $3, $4)`,
+            [requestId, fromUserId, targetUser.id, 'PENDING']
+        ).catch(() => {});
     }
 
-    console.log(`[FRIEND REQUEST] ${fromUser.fullTag} -> ${targetUser.fullTag}`);
+    const targetSocket = activeConnections.get(targetUser.id);
+    if (targetSocket && targetSocket.readyState === WebSocket.OPEN) {
+        targetSocket.send(JSON.stringify({ event: 'FRIEND_REQUEST_RECEIVED', request }));
+    }
+
     res.json({ success: true, message: `Friend request sent to ${targetUser.fullTag}!` });
 });
 
-// Get Pending Incoming Requests
 app.get('/api/friends/pending/:userId', (req, res) => {
     const { userId } = req.params;
     const incoming = [];
-
     for (const reqItem of pendingFriendRequests.values()) {
         if (reqItem.toUserId === userId && reqItem.status === 'PENDING') {
             incoming.push(reqItem);
         }
     }
-
     res.json({ success: true, requests: incoming });
 });
 
-// Respond to Friend Request (ACCEPT / DECLINE)
-app.post('/api/friends/respond', (req, res) => {
-    const { requestId, action } = req.body; // action: 'ACCEPT' or 'DECLINE'
+app.post('/api/friends/respond', async (req, res) => {
+    const { requestId, action } = req.body;
     const request = pendingFriendRequests.get(requestId);
-
     if (!request) return res.status(404).json({ error: 'Request not found' });
 
     if (action === 'ACCEPT') {
@@ -284,7 +441,16 @@ app.post('/api/friends/respond', (req, res) => {
         friendships.get(request.fromUserId).add(request.toUserId);
         friendships.get(request.toUserId).add(request.fromUserId);
 
-        // Notify both if online
+        if (dbPool) {
+            try {
+                await dbPool.query(
+                    `INSERT INTO friendships (user_id, friend_id) VALUES ($1, $2), ($2, $1) ON CONFLICT DO NOTHING`,
+                    [request.fromUserId, request.toUserId]
+                );
+                await dbPool.query('DELETE FROM friend_requests WHERE request_id = $1', [requestId]);
+            } catch (_) {}
+        }
+
         const s1 = activeConnections.get(request.fromUserId);
         const s2 = activeConnections.get(request.toUserId);
         const acceptedMsg = JSON.stringify({ event: 'FRIEND_ACCEPTED', requestId });
@@ -292,9 +458,10 @@ app.post('/api/friends/respond', (req, res) => {
         if (s2 && s2.readyState === WebSocket.OPEN) s2.send(acceptedMsg);
 
         pendingFriendRequests.delete(requestId);
-        return res.json({ success: true, message: 'Friend request accepted!' });
+        return res.json({ success: true, message: 'Friend request accepted and saved to Supabase!' });
     } else {
         request.status = 'DECLINED';
+        if (dbPool) dbPool.query('DELETE FROM friend_requests WHERE request_id = $1', [requestId]).catch(() => {});
         pendingFriendRequests.delete(requestId);
         return res.json({ success: true, message: 'Friend request declined.' });
     }
@@ -312,7 +479,7 @@ app.get('/api/market/listings', (req, res) => {
     res.json({ success: true, listings: active });
 });
 
-app.post('/api/market/list-card', (req, res) => {
+app.post('/api/market/list-card', async (req, res) => {
     const { sellerId, card, startingBid, buyNowPrice, durationMinutes } = req.body;
     const user = users.get(sellerId);
     if (!user) return res.status(404).json({ error: 'User not found' });
@@ -337,11 +504,17 @@ app.post('/api/market/list-card', (req, res) => {
 
     marketListings.set(listingId, listing);
 
-    // Broadcast new listing to all connected players
-    broadcastAll({
-        event: 'MARKET_NEW_LISTING',
-        listing
-    });
+    if (dbPool) {
+        try {
+            await dbPool.query(
+                `INSERT INTO market_listings (id, seller_id, seller_name, card_data, starting_bid, current_bid, buy_now_price, expires_at, status)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+                [listing.id, listing.sellerId, listing.sellerName, JSON.stringify(listing.card), listing.startingBid, listing.currentBid, listing.buyNowPrice, listing.expiresAt, listing.status]
+            );
+        } catch (_) {}
+    }
+
+    broadcastAll({ event: 'MARKET_NEW_LISTING', listing });
 
     res.json({ success: true, listing });
 });
@@ -367,13 +540,10 @@ wss.on('connection', (ws) => {
             const { event } = data;
 
             switch (event) {
-                // Presence registration
                 case 'REGISTER_PRESENCE': {
                     currentUserId = data.userId;
                     activeConnections.set(currentUserId, ws);
-                    console.log(`[ONLINE] Player connected: ${currentUserId}`);
 
-                    // Notify friends that this user is now online
                     const myFriends = friendships.get(currentUserId) || new Set();
                     myFriends.forEach(friendId => {
                         const friendSocket = activeConnections.get(friendId);
@@ -394,7 +564,6 @@ wss.on('connection', (ws) => {
                     break;
                 }
 
-                // Direct Challenge
                 case 'SEND_CHALLENGE': {
                     const { fromUserId, targetUserId, mode } = data;
                     const fromUser = users.get(fromUserId);
@@ -418,14 +587,10 @@ wss.on('connection', (ws) => {
                         mode: mode || 'DUEL'
                     }));
 
-                    ws.send(JSON.stringify({
-                        event: 'CHALLENGE_SENT',
-                        targetUserId
-                    }));
+                    ws.send(JSON.stringify({ event: 'CHALLENGE_SENT', targetUserId }));
                     break;
                 }
 
-                // Accept Challenge -> Auto-create Room
                 case 'ACCEPT_CHALLENGE': {
                     const { challengeId, hostId, guestId } = data;
                     const roomCode = `FA-${Math.floor(1000 + Math.random() * 9000)}`;
@@ -446,7 +611,6 @@ wss.on('connection', (ws) => {
                     break;
                 }
 
-                // Real-time Authoritative Auction Bidding
                 case 'AUCTION_BID': {
                     const { roomCode, userId, amount } = data;
                     const room = auctionRooms.get(roomCode);
@@ -470,9 +634,8 @@ wss.on('connection', (ws) => {
                     room.currentHighestBid = amount;
                     room.highestBidderId = userId;
                     room.highestBidderName = user.managerName;
-                    room.secondsRemaining = 10; // Server resets 10s timer!
+                    room.secondsRemaining = 10;
 
-                    // Broadcast new bid to all participants in this room
                     broadcastToRoom(roomCode, {
                         event: 'AUCTION_BID_ACCEPTED',
                         highestBid: amount,
@@ -491,9 +654,6 @@ wss.on('connection', (ws) => {
     ws.on('close', () => {
         if (currentUserId) {
             activeConnections.delete(currentUserId);
-            console.log(`[OFFLINE] Player disconnected: ${currentUserId}`);
-
-            // Notify friends that user is offline
             const myFriends = friendships.get(currentUserId) || new Set();
             myFriends.forEach(friendId => {
                 const friendSocket = activeConnections.get(friendId);
@@ -526,6 +686,6 @@ server.listen(PORT, '0.0.0.0', () => {
     console.log(`====================================================`);
     console.log(`🚀 FootAuction FC Real-Time Server running on port ${PORT}`);
     console.log(`📡 WebSocket Gateway ready at ws://localhost:${PORT}/ws`);
-    console.log(`⚽ Free & Serverless Ready (Render / Koyeb / Supabase)`);
+    console.log(`⚡ Supabase PostgreSQL Ready (Auto-creates tables on boot)`);
     console.log(`====================================================`);
 });
