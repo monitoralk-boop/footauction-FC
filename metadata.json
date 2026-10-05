@@ -1,0 +1,6 @@
+{
+  "name": "FootAuction FC",
+  "description": "Football Player Auction Game featuring 1v1 Bidding Battles, 8-Manager Tournaments, FIFA-style Player Cards, and League Transfer Market.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
